@@ -1,0 +1,71 @@
+# Конфигурация голосового ассистента
+
+# Аудио настройки
+audio:
+  sample_rate: 16000
+  channels: 1
+  chunk_size: 1024
+  device_index: null  # null = устройство по умолчанию
+
+# Wake Word Detection (Vosk)
+wake_word:
+  enabled: true
+  keyword: "привет ассистент"
+  model_path: "models/vosk-model-small-ru-0.22"
+  model_url: "https://alphacephei.com/vosk/models/vosk-model-small-ru-0.22.zip"
+
+# Speech Recognition (Faster-Whisper)
+speech_recognition:
+  model_name: "large-v3-turbo"  # tiny, base, small, medium, large-v3, large-v3-turbo
+  device: "cuda"  # cuda или cpu
+  compute_type: "float16"  # float16, int8_float16, int8
+  language: "ru"
+  beam_size: 5  # 1 для скорости, 5 для качества
+  vad_filter: false
+  
+  # Параметры записи
+  max_recording_seconds: 10
+  silent_frames_to_stop: 15
+  min_sound_frames: 3
+  
+  # Чувствительность (1-10)
+  sensitivity: 7
+  
+  # Калибровка
+  auto_calibrate: false
+  calibration_duration: 2.0  # секунды
+  calibration_frames: 30
+
+# VAD (Silero)
+vad:
+  enabled: true
+  threshold: 0.5  # 0.0 - 1.0
+  min_speech_duration_ms: 250
+  min_silence_duration_ms: 500
+
+# LLM (Gemini)
+gemini:
+  api_key: "AIzaSyCyNC5KvWuJk4CJ5UTZZMonzDHukxWRZ-Q"
+  model: "gemini-2.0-flash-exp"
+  temperature: 0.7
+  max_output_tokens: 200
+  
+  # Прокси (опционально)
+  proxy:
+    enabled: true
+    type: "socks5"
+    host: "127.0.0.1"
+    port: 10808
+
+# UI настройки
+ui:
+  window_width: 700
+  window_height: 550
+  theme: "dark"  # light или dark
+
+# Логирование
+logging:
+  level: "INFO"  # DEBUG, INFO, WARNING, ERROR
+  console: true
+  file: "voice_assistant.log"
+  format: "%(asctime)s - %(name)s - %(levelname)s - %(message)s"

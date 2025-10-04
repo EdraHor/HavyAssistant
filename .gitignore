@@ -1,0 +1,69 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+MANIFEST
+
+# Virtual Environment
+venv/
+ENV/
+env/
+.venv
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.DS_Store
+
+# Models (большие файлы)
+models/*.bin
+models/*.ggml
+models/*.pt
+models/*.pth
+models/*.zip
+models/vosk-*/
+models/whisper-*/
+
+# Logs
+*.log
+voice_assistant.log
+
+# Config (может содержать API ключи)
+config/settings.local.yaml
+
+# PyQt
+*.ui~
+*.qrc~
+
+# Temporary files
+*.tmp
+*.bak
+*.cache
+
+# OS
+Thumbs.db
+
+# База данных
+data/
+*.db
+*.db-journal
