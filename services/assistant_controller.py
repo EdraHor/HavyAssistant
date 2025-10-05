@@ -1,6 +1,5 @@
 """
-Контроллер голосового ассистента - вся бизнес-логика
-Может работать без UI
+Контроллер голосового ассистента с поддержкой TTS
 """
 
 import logging
@@ -13,6 +12,7 @@ from services.audio_capture import AudioCaptureService
 from services.wake_word import WakeWordService
 from services.speech_recognition import SpeechRecognitionService
 from services.llm_service import GeminiService
+from tts import TTSService  # НОВОЕ
 
 logger = logging.getLogger(__name__)
 
@@ -23,28 +23,27 @@ class AssistantState(Enum):
     LISTENING_WAKE_WORD = "listening_wake_word"
     RECORDING_COMMAND = "recording_command"
     PROCESSING_LLM = "processing_llm"
+    SPEAKING = "speaking"  # НОВОЕ
     ERROR = "error"
 
 class VoiceAssistantController:
-    """
-    Основной контроллер голосового ассистента
-    Управляет всеми сервисами и координирует их работу
-    """
-    
+    """Основной контроллер с TTS"""
+
     def __init__(self):
         # Сервисы
         self.audio_service = AudioCaptureService()
         self.wake_word_service = WakeWordService()
         self.speech_service = SpeechRecognitionService()
         self.gemini_service = GeminiService()
-        
+        self.tts_service = TTSService()  # НОВОЕ
+
         # Состояние
         self.state = AssistantState.STOPPED
         self.selected_device_index = None
         self.wake_word = config.get('wake_word.keyword', 'привет ассистент')
         self.sensitivity = config.get('speech_recognition.sensitivity', 5)
-        
-        # Callbacks для UI или других компонентов
+
+        # Callbacks
         self.callbacks = {
             'on_state_changed': None,
             'on_status_update': None,
@@ -58,15 +57,17 @@ class VoiceAssistantController:
             'on_noise_floor_calibrated': None,
             'on_history_updated': None,
             'on_threshold_updated': None,
+            'on_tts_start': None,  # НОВОЕ
+            'on_tts_finish': None,  # НОВОЕ
         }
 
-        # Настройка внутренних коллбэков
+        # Настройка callbacks
         self._setup_service_callbacks()
 
         logger.info("✓ VoiceAssistantController инициализирован")
 
     def _setup_service_callbacks(self):
-        """Настройка callbacks от сервисов"""
+        """Настройка callbacks"""
         # Wake Word
         self.wake_word_service.set_wake_word_callback(self._on_wake_word_detected)
         self.wake_word_service.set_audio_level_callback(self._on_audio_level_wake)
@@ -80,8 +81,14 @@ class VoiceAssistantController:
         self.gemini_service.set_response_callback(self._on_llm_response)
         self.gemini_service.set_error_callback(self._on_llm_error)
 
+        # TTS - НОВОЕ
+        self.tts_service.set_callbacks(
+            on_start=self._on_tts_start,
+            on_finish=self._on_tts_finish
+        )
+
     def set_callback(self, event: str, callback: Callable):
-        """Установить callback для события"""
+        """Установить callback"""
         if event in self.callbacks:
             self.callbacks[event] = callback
             logger.debug(f"Установлен callback для '{event}'")
@@ -89,7 +96,7 @@ class VoiceAssistantController:
             logger.warning(f"Неизвестный callback: '{event}'")
 
     def _emit(self, event: str, *args, **kwargs):
-        """Вызвать callback если установлен"""
+        """Вызвать callback"""
         try:
             if self.callbacks.get(event):
                 self.callbacks[event](*args, **kwargs)
@@ -109,7 +116,7 @@ class VoiceAssistantController:
         self._emit('on_log', message)
 
     def get_audio_devices(self):
-        """Получить список аудио устройств"""
+        """Получить аудио устройства"""
         try:
             return self.audio_service.get_audio_devices()
         except Exception as e:
@@ -117,13 +124,7 @@ class VoiceAssistantController:
             return []
 
     def start(self, device_index: int, wake_word: Optional[str] = None):
-        """
-        Запустить ассистент
-
-        Args:
-            device_index: Индекс аудио устройства
-            wake_word: Ключевое слово (опционально)
-        """
+        """Запустить ассистент"""
         if self.state != AssistantState.STOPPED:
             logger.warning("Ассистент уже запущен")
             return False
@@ -135,7 +136,7 @@ class VoiceAssistantController:
             if wake_word:
                 self.wake_word = wake_word
 
-            # Запуск инициализации в отдельном потоке
+            # Инициализация в потоке
             init_thread = threading.Thread(
                 target=self._initialize_services,
                 daemon=True
@@ -151,7 +152,7 @@ class VoiceAssistantController:
             return False
 
     def _initialize_services(self):
-        """Инициализация сервисов (в отдельном потоке)"""
+        """Инициализация всех сервисов"""
         try:
             # Vosk
             self._emit('on_status_update', "Загрузка Vosk...", "orange")
@@ -165,7 +166,14 @@ class VoiceAssistantController:
             self.speech_service.update_sensitivity(self.sensitivity)
             logger.info("✓ Whisper инициализирован")
 
-            # Запуск захвата аудио
+            # TTS - НОВОЕ
+            if config.get('tts.enabled', True):
+                tts_engine = config.get('tts.engine', 'silero')
+                self._emit('on_status_update', f"Загрузка TTS ({tts_engine})...", "orange")
+                self.tts_service.initialize()
+                logger.info("✓ TTS инициализирован")
+
+            # Аудио захват
             self.audio_service.start_capture(
                 self.selected_device_index,
                 self._on_audio_data
@@ -192,10 +200,10 @@ class VoiceAssistantController:
         try:
             logger.info("Остановка ассистента...")
 
-            # Останавливаем сервисы
             self.audio_service.stop_capture()
             self.speech_service.stop()
             self.wake_word_service.stop()
+            self.tts_service.cleanup()  # НОВОЕ
 
             self._set_state(AssistantState.STOPPED)
             self._emit('on_status_update', "Остановлено", "gray")
@@ -207,7 +215,7 @@ class VoiceAssistantController:
             logger.error(f"Ошибка остановки: {e}", exc_info=True)
 
     def calibrate_noise_floor(self, duration: float = 2.0):
-        """Калибровка фонового шума"""
+        """Калибровка"""
         if self.state not in [AssistantState.LISTENING_WAKE_WORD]:
             logger.warning("Калибровка доступна только в режиме ожидания")
             return
@@ -229,27 +237,26 @@ class VoiceAssistantController:
             logger.error(f"Ошибка запуска калибровки: {e}", exc_info=True)
 
     def update_sensitivity(self, level: int):
-        """Обновить чувствительность (1-10) - работает в реалтайм"""
+        """Обновить чувствительность"""
         try:
             self.sensitivity = level
             self.speech_service.update_sensitivity(level)
 
-            # Получаем новый порог для отображения
             new_threshold = self.speech_service.get_voice_threshold()
             self._emit('on_threshold_updated', new_threshold)
 
-            logger.info(f"✓ Чувствительность: {level}/10, новый порог: {new_threshold:.4f}")
+            logger.info(f"✓ Чувствительность: {level}/10, порог: {new_threshold:.4f}")
         except Exception as e:
             logger.error(f"Ошибка обновления чувствительности: {e}", exc_info=True)
 
     def reset_context(self):
-        """Сброс контекста LLM"""
+        """Сброс контекста"""
         try:
             old_count = self.gemini_service.get_history_length()
             self.gemini_service.clear_history()
             new_count = self.gemini_service.get_history_length()
 
-            self._log(f"Новая сессия создана (старая с {old_count} сообщениями сохранена)")
+            self._log(f"Новая сессия (старая с {old_count} сообщениями сохранена)")
             self._emit('on_history_updated', new_count)
 
             logger.info(f"✓ Контекст сброшен: {old_count} -> {new_count}")
@@ -258,7 +265,7 @@ class VoiceAssistantController:
             logger.error(f"Ошибка сброса контекста: {e}", exc_info=True)
 
     def get_history_length(self) -> int:
-        """Получить длину истории"""
+        """Длина истории"""
         try:
             return self.gemini_service.get_history_length()
         except Exception as e:
@@ -266,9 +273,8 @@ class VoiceAssistantController:
             return 0
 
     def _on_audio_data(self, audio_data: bytes):
-        """Обработка аудио данных"""
+        """Обработка аудио"""
         try:
-            # Если идет калибровка - данные идут в speech_service
             if self.speech_service.is_calibrating:
                 self.speech_service.process_audio(audio_data)
             elif self.state == AssistantState.LISTENING_WAKE_WORD:
@@ -282,14 +288,14 @@ class VoiceAssistantController:
         """Wake Word обнаружено"""
         try:
             self._set_state(AssistantState.RECORDING_COMMAND)
-            self._emit('on_status_update', "🎤 Ключевое слово обнаружено! Слушаю команду...", "blue")
-            self._log("🔑 WAKE WORD обнаружено → переключение на Whisper")
+            self._emit('on_status_update', "🎤 Ключевое слово! Слушаю...", "blue")
+            self._log("🔑 WAKE WORD → Whisper")
             self._emit('on_wake_word_detected')
 
             self.speech_service.start_recording()
 
         except Exception as e:
-            logger.error(f"Ошибка обработки wake word: {e}", exc_info=True)
+            logger.error(f"Ошибка wake word: {e}", exc_info=True)
             self._set_state(AssistantState.LISTENING_WAKE_WORD)
 
     def _on_speech_recognized(self, text: str):
@@ -304,82 +310,111 @@ class VoiceAssistantController:
                 # Отправка в LLM
                 self._send_to_llm(text)
 
-            # Возврат к ожиданию wake word
+            # Возврат к wake word
             self._set_state(AssistantState.LISTENING_WAKE_WORD)
-            self._emit('on_status_update', f"Слушаю... Скажите '{self.wake_word}'", "green")
+            self._emit('on_status_update', f"Слушаю... '{self.wake_word}'", "green")
             self.wake_word_service.stop()
 
         except Exception as e:
-            logger.error(f"Ошибка обработки распознанной речи: {e}", exc_info=True)
+            logger.error(f"Ошибка распознавания: {e}", exc_info=True)
             self._set_state(AssistantState.LISTENING_WAKE_WORD)
 
     def _on_audio_level_wake(self, rms: float, status: str):
-        """Уровень звука от Wake Word"""
+        """Уровень от Wake Word"""
         if self.state == AssistantState.LISTENING_WAKE_WORD:
             self._emit('on_audio_level', rms, status)
 
     def _on_audio_level_speech(self, rms: float, status: str):
-        """Уровень звука от Speech Recognition"""
+        """Уровень от Speech"""
         if self.state == AssistantState.RECORDING_COMMAND:
             self._emit('on_audio_level', rms, status)
 
     def _on_noise_floor_calibrated(self, noise_floor: float):
         """Калибровка завершена"""
         try:
-            self._log(f"✅ КАЛИБРОВКА: фоновый уровень = {noise_floor:.4f}")
+            self._log(f"✅ КАЛИБРОВКА: {noise_floor:.4f}")
             self._emit('on_noise_floor_calibrated', noise_floor)
 
-            # Также отправляем обновленный порог
             new_threshold = self.speech_service.get_voice_threshold()
             self._emit('on_threshold_updated', new_threshold)
-            self._log(f"✅ Новый порог голоса: {new_threshold:.4f}")
+            self._log(f"✅ Порог: {new_threshold:.4f}")
 
         except Exception as e:
-            logger.error(f"Ошибка в callback калибровки: {e}", exc_info=True)
+            logger.error(f"Ошибка callback калибровки: {e}", exc_info=True)
 
     def _send_to_llm(self, query: str):
-        """Отправка запроса в LLM"""
+        """Отправка в LLM"""
         try:
             self._set_state(AssistantState.PROCESSING_LLM)
-            self._log(f"📤 Отправка в Gemini: {query}")
-            self._emit('on_status_update', "Обработка запроса...", "orange")
+            self._log(f"📤 Gemini: {query}")
+            self._emit('on_status_update', "Обработка...", "orange")
 
             def process():
                 try:
                     self.gemini_service.send_query(query)
                 except Exception as e:
-                    logger.error(f"Ошибка запроса к LLM: {e}", exc_info=True)
-                    self._on_llm_error(f"Ошибка запроса: {str(e)}")
+                    logger.error(f"Ошибка LLM: {e}", exc_info=True)
+                    self._on_llm_error(f"Ошибка: {str(e)}")
 
             threading.Thread(target=process, daemon=True).start()
 
         except Exception as e:
-            logger.error(f"Ошибка отправки в LLM: {e}", exc_info=True)
+            logger.error(f"Ошибка отправки LLM: {e}", exc_info=True)
             self._set_state(AssistantState.LISTENING_WAKE_WORD)
 
     def _on_llm_response(self, response: str):
-        """Ответ от LLM"""
+        """Ответ от LLM - ОБНОВЛЕНО"""
         try:
-            self._log(f"📥 Ответ Gemini: {response}")
+            self._log(f"📥 Gemini: {response}")
             self._emit('on_llm_response', response)
 
             history_count = self.gemini_service.get_history_length()
             self._emit('on_history_updated', history_count)
 
-            self._set_state(AssistantState.LISTENING_WAKE_WORD)
-            self._emit('on_status_update', f"Слушаю... Скажите '{self.wake_word}'", "green")
+            # НОВОЕ: Озвучивание ответа
+            if config.get('tts.enabled', True):
+                self._set_state(AssistantState.SPEAKING)
+                self._emit('on_status_update', "🔊 Озвучивание ответа...", "blue")
+
+                # Озвучка в отдельном потоке
+                def speak():
+                    try:
+                        self.tts_service.speak(response)
+                        # После озвучки возврат к wake word
+                        self._set_state(AssistantState.LISTENING_WAKE_WORD)
+                        self._emit('on_status_update', f"Слушаю... '{self.wake_word}'", "green")
+                    except Exception as e:
+                        logger.error(f"Ошибка озвучки: {e}", exc_info=True)
+                        self._set_state(AssistantState.LISTENING_WAKE_WORD)
+
+                threading.Thread(target=speak, daemon=True).start()
+            else:
+                # Если TTS выключен
+                self._set_state(AssistantState.LISTENING_WAKE_WORD)
+                self._emit('on_status_update', f"Слушаю... '{self.wake_word}'", "green")
 
         except Exception as e:
-            logger.error(f"Ошибка обработки ответа LLM: {e}", exc_info=True)
+            logger.error(f"Ошибка обработки ответа: {e}", exc_info=True)
 
     def _on_llm_error(self, error: str):
         """Ошибка LLM"""
         try:
-            self._log(f"❌ Ошибка Gemini: {error}")
+            self._log(f"❌ Gemini: {error}")
             self._emit('on_llm_error', error)
 
             self._set_state(AssistantState.LISTENING_WAKE_WORD)
-            self._emit('on_status_update', "Ошибка обработки запроса", "red")
+            self._emit('on_status_update', "Ошибка", "red")
 
         except Exception as e:
-            logger.error(f"Ошибка обработки ошибки LLM: {e}", exc_info=True)
+            logger.error(f"Ошибка обработки ошибки: {e}", exc_info=True)
+
+    # НОВЫЕ callbacks для TTS
+    def _on_tts_start(self, text: str):
+        """TTS начал озвучивание"""
+        self._log(f"🔊 Озвучивание: {text[:50]}...")
+        self._emit('on_tts_start', text)
+
+    def _on_tts_finish(self):
+        """TTS завершил озвучивание"""
+        self._log("✅ Озвучивание завершено")
+        self._emit('on_tts_finish')

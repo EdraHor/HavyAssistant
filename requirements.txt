@@ -3,6 +3,7 @@ PyQt5>=5.15.10
 
 # Аудио
 sounddevice>=0.4.6
+soundfile>=0.12.1
 numpy>=1.24.0
 
 # Speech Recognition
@@ -14,6 +15,15 @@ torchaudio>=2.0.0
 # AI/LLM
 requests>=2.31.0
 google-generativeai>=0.3.2
+
+# TTS (Text-to-Speech) - НОВОЕ
+# Для Silero (рекомендуется)
+omegaconf>=2.3.0  # Требуется для Silero
+# torch уже есть выше
+# Silero загружается через torch.hub автоматически
+
+# Для Piper (опционально)
+# piper-tts>=1.2.0  # раскомментировать если используете Piper
 
 # Утилиты
 PyYAML>=6.0.1

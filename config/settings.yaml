@@ -57,6 +57,14 @@ gemini:
     host: "127.0.0.1"
     port: 10808
 
+# TTS (Text-to-Speech)
+tts:
+  enabled: true
+  engine: "silero"  # silero или piper
+  device: "cuda"  # cuda или cpu
+  voice: "baya"  # для silero: baya, kseniya, xenia, aidar
+                 # для piper: ru_iryna, ru_dmitri
+
 # UI настройки
 ui:
   window_width: 700

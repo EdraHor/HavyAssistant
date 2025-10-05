@@ -1,0 +1,7 @@
+"""
+TTS (Text-to-Speech) модуль
+"""
+
+from .tts_service import TTSService
+
+__all__ = ['TTSService']
