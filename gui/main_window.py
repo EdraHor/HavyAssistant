@@ -1,77 +1,132 @@
 """
-Главное окно приложения (PyQt5)
+Главное окно приложения (PyQt5) - только UI
+С реалтайм отображением калибровки и чувствительности
 """
 
 import logging
-from gui.loading_overlay import LoadingOverlay
-from datetime import datetime
 from PyQt5.QtWidgets import (QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
                              QLabel, QComboBox, QLineEdit, QSlider, QPushButton,
                              QProgressBar, QTextEdit, QGroupBox, QMessageBox)
-from PyQt5.QtCore import Qt, QTimer, pyqtSignal, QThread, QSettings
-from PyQt5.QtGui import QFont, QColor
+from PyQt5.QtCore import Qt, QTimer, pyqtSignal, QSettings
+from PyQt5.QtGui import QFont, QPainter, QColor
+from PyQt5.QtWidgets import QStyle
 
-from utils.config_loader import config
-from services.audio_capture import AudioCaptureService
-from services.wake_word import WakeWordService
-from services.speech_recognition import SpeechRecognitionService
-from services.llm_service import GeminiService
+from gui.loading_overlay import LoadingOverlay
+from services.assistant_controller import VoiceAssistantController, AssistantState
 from services.notification_service import NotificationService
+from utils.config_loader import config
 
 logger = logging.getLogger(__name__)
 
+class ThresholdProgressBar(QProgressBar):
+    """Прогресс-бар с линией порога"""
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.threshold_value = 0
+        self.noise_floor_value = 0
+
+    def set_threshold(self, threshold: float):
+        """Установить значение порога (0.0-1.0)"""
+        self.threshold_value = min(int(threshold * 300), 100)
+        self.update()
+
+    def set_noise_floor(self, noise_floor: float):
+        """Установить значение фона (0.0-1.0)"""
+        self.noise_floor_value = min(int(noise_floor * 300), 100)
+        self.update()
+
+    def paintEvent(self, event):
+        """Рисуем прогресс-бар с линиями порога и фона"""
+        super().paintEvent(event)
+
+        if self.threshold_value > 0 or self.noise_floor_value > 0:
+            painter = QPainter(self)
+
+            # Линия фона (серая, пунктирная)
+            if self.noise_floor_value > 0:
+                noise_x = int(self.width() * self.noise_floor_value / 100)
+                painter.setPen(QColor(150, 150, 150))
+                for y in range(0, self.height(), 4):
+                    painter.drawLine(noise_x, y, noise_x, y + 2)
+
+            # Линия порога (красная, сплошная)
+            if self.threshold_value > 0:
+                threshold_x = int(self.width() * self.threshold_value / 100)
+                painter.setPen(QColor(255, 100, 100, 200))
+                painter.drawLine(threshold_x, 0, threshold_x, self.height())
+
+            painter.end()
+
 class MainWindow(QMainWindow):
-    """Главное окно голосового ассистента"""
-    calibration_done = pyqtSignal()
+    """Главное окно голосового ассистента - только отображение"""
+
+    # Сигналы для thread-safe обновления UI
+    update_status_signal = pyqtSignal(str, str)
+    update_audio_level_signal = pyqtSignal(float, str)
+    add_log_signal = pyqtSignal(str)
+    update_history_signal = pyqtSignal(int)
+    update_noise_floor_signal = pyqtSignal(float)
+    update_threshold_signal = pyqtSignal(float)
+    show_notification_signal = pyqtSignal(str, str)
+    show_error_signal = pyqtSignal(str, str)
 
     def __init__(self):
         super().__init__()
 
-        # Сервисы
-        self.audio_service = AudioCaptureService()
-        self.wake_word_service = WakeWordService()
-        self.speech_service = SpeechRecognitionService()
-        self.gemini_service = GeminiService()
-        self.notification_service = NotificationService()
+        try:
+            # Контроллер (вся логика здесь)
+            self.controller = VoiceAssistantController()
 
-        # Состояние
-        self.is_listening = False
-        self.selected_device = None
+            # Сервис уведомлений
+            self.notification_service = NotificationService()
 
-        # QSettings для сохранения настроек
-        self.settings = QSettings("VoiceAssistant", "HavyAssistant")
+            # QSettings для сохранения настроек
+            self.settings = QSettings("VoiceAssistant", "HavyAssistant")
 
-        # Флаг: НЕ сохранять во время инициализации
-        self._is_initializing = True
+            # Флаг инициализации
+            self._is_initializing = True
 
-        # Настройка окна
-        self.setWindowTitle("Голосовой Ассистент (GPU)")
-        self.setGeometry(100, 100,
-                         config.get('ui.window_width', 700),
-                         config.get('ui.window_height', 550))
+            # Текущие значения для отображения
+            self.current_noise_floor = 0.0
+            self.current_threshold = 0.0
 
-        # Создание UI
-        self._init_ui()
-        self._setup_callbacks()
-        self._apply_theme()
+            # Настройка окна
+            self.setWindowTitle("Голосовой Ассистент (GPU)")
+            self.setGeometry(100, 100,
+                             config.get('ui.window_width', 700),
+                             config.get('ui.window_height', 550))
 
-        # Оверлей загрузки
-        self.loading_overlay = LoadingOverlay(self)
+            # Создание UI
+            self._init_ui()
+            self._apply_theme()
 
-        # Загрузка сохраненных настроек
-        self._load_settings()
+            # Оверлей загрузки
+            self.loading_overlay = LoadingOverlay(self)
 
-        # ВАЖНО: Теперь можно сохранять
-        self._is_initializing = False
+            # Подключение сигналов
+            self._connect_signals()
 
-        # Обновляем счетчик истории
-        if hasattr(self, 'history_label'):
-            history_count = self.gemini_service.get_history_length()
+            # Подключение к контроллеру
+            self._connect_controller()
+
+            # Загрузка настроек
+            self._load_settings()
+
+            # Конец инициализации
+            self._is_initializing = False
+
+            # Обновление истории
+            history_count = self.controller.get_history_length()
             self.history_label.setText(f"История: {history_count} сообщений")
             if history_count > 0:
                 self._add_log(f"Загружена история: {history_count} сообщений")
 
-        logger.info("GUI инициализирован")
+            logger.info("✓ GUI инициализирован")
+
+        except Exception as e:
+            logger.error(f"Ошибка инициализации GUI: {e}", exc_info=True)
+            raise
 
     def _init_ui(self):
         """Создание интерфейса"""
@@ -87,11 +142,10 @@ class MainWindow(QMainWindow):
         mic_layout = QVBoxLayout()
 
         self.device_combo = QComboBox()
-        devices = self.audio_service.get_audio_devices()
+        devices = self.controller.get_audio_devices()
         for device in devices:
             self.device_combo.addItem(device['name'], device['index'])
         mic_layout.addWidget(self.device_combo)
-        self.device_combo.currentIndexChanged.connect(lambda: self._save_settings())
 
         mic_group.setLayout(mic_layout)
         layout.addWidget(mic_group)
@@ -101,14 +155,13 @@ class MainWindow(QMainWindow):
         wake_layout = QVBoxLayout()
 
         self.wake_word_input = QLineEdit()
-        self.wake_word_input.editingFinished.connect(self._save_settings)
         wake_layout.addWidget(self.wake_word_input)
 
         wake_group.setLayout(wake_layout)
         layout.addWidget(wake_group)
 
         # 3. Чувствительность
-        sens_group = QGroupBox("Чувствительность")
+        sens_group = QGroupBox("Чувствительность (работает в реальном времени)")
         sens_layout = QVBoxLayout()
 
         sens_header = QHBoxLayout()
@@ -124,7 +177,6 @@ class MainWindow(QMainWindow):
         self.sensitivity_slider.setValue(config.get('speech_recognition.sensitivity', 5))
         self.sensitivity_slider.setTickPosition(QSlider.TicksBelow)
         self.sensitivity_slider.setTickInterval(1)
-        self.sensitivity_slider.valueChanged.connect(self._on_sensitivity_changed)
         sens_layout.addWidget(self.sensitivity_slider)
 
         hint_label = QLabel("← Менее чувствительно  |  Более чувствительно →")
@@ -135,22 +187,50 @@ class MainWindow(QMainWindow):
         sens_group.setLayout(sens_layout)
         layout.addWidget(sens_group)
 
-        # 4. Индикатор звука
-        audio_group = QGroupBox("Уровень звука")
+        # 4. Индикатор звука с калибровкой
+        audio_group = QGroupBox("Уровень звука и калибровка")
         audio_layout = QVBoxLayout()
 
+        # Заголовок с информацией
         audio_header = QHBoxLayout()
-        audio_header.addWidget(QLabel("Уровень звука:"))
-        self.noise_floor_label = QLabel("Фон не откалиброван")
-        self.noise_floor_label.setStyleSheet("color: gray; font-size: 11px;")
+        audio_header.addWidget(QLabel("Текущий уровень:"))
+
+        # Информация о калибровке (расширенная)
+        calibration_info = QVBoxLayout()
+        calibration_info.setSpacing(2)
+
+        self.noise_floor_label = QLabel("Фон: не откалиброван")
+        self.noise_floor_label.setStyleSheet("color: #888; font-size: 11px;")
+        calibration_info.addWidget(self.noise_floor_label)
+
+        self.threshold_label = QLabel("Порог: не установлен")
+        self.threshold_label.setStyleSheet("color: #888; font-size: 11px;")
+        calibration_info.addWidget(self.threshold_label)
+
+        audio_header.addLayout(calibration_info)
         audio_header.addStretch()
-        audio_header.addWidget(self.noise_floor_label)
+
+        # Легенда
+        legend_layout = QVBoxLayout()
+        legend_layout.setSpacing(2)
+
+        legend_noise = QLabel("━━ Фон (серый)")
+        legend_noise.setStyleSheet("color: #888; font-size: 10px;")
+        legend_layout.addWidget(legend_noise)
+
+        legend_threshold = QLabel("━━ Порог (красный)")
+        legend_threshold.setStyleSheet("color: #ff6464; font-size: 10px;")
+        legend_layout.addWidget(legend_threshold)
+
+        audio_header.addLayout(legend_layout)
         audio_layout.addLayout(audio_header)
 
-        self.audio_progress = QProgressBar()
+        # Прогресс-бар с линиями порога
+        self.audio_progress = ThresholdProgressBar()
         self.audio_progress.setMaximum(100)
         self.audio_progress.setTextVisible(True)
         self.audio_progress.setFormat("Тишина")
+        self.audio_progress.setMinimumHeight(30)
         audio_layout.addWidget(self.audio_progress)
 
         audio_group.setLayout(audio_layout)
@@ -166,7 +246,6 @@ class MainWindow(QMainWindow):
         self.status_label.setStyleSheet("color: gray;")
         status_header.addWidget(self.status_label)
 
-        # Индикатор истории диалога
         self.history_label = QLabel("История: 0 сообщений")
         self.history_label.setStyleSheet("color: gray; font-size: 10px;")
         status_header.addStretch()
@@ -194,100 +273,109 @@ class MainWindow(QMainWindow):
         self.start_btn = QPushButton("Запустить")
         self.start_btn.setMinimumHeight(40)
         self.start_btn.setFont(QFont("Segoe UI", 11, QFont.Bold))
-        self.start_btn.clicked.connect(self._toggle_listening)
         btn_layout.addWidget(self.start_btn)
 
-        self.calibrate_btn = QPushButton("Калибровка")
+        self.calibrate_btn = QPushButton("Калибровка (2с)")
         self.calibrate_btn.setMinimumHeight(40)
         self.calibrate_btn.setEnabled(False)
-        self.calibrate_btn.clicked.connect(self._calibrate)
         btn_layout.addWidget(self.calibrate_btn)
 
         self.clear_btn = QPushButton("Очистить")
         self.clear_btn.setMinimumHeight(40)
-        self.clear_btn.clicked.connect(self._clear_log)
         btn_layout.addWidget(self.clear_btn)
 
         self.reset_context_btn = QPushButton("Сброс контекста")
         self.reset_context_btn.setMinimumHeight(40)
-        self.reset_context_btn.clicked.connect(self._reset_context)
         btn_layout.addWidget(self.reset_context_btn)
 
         layout.addLayout(btn_layout)
 
         central_widget.setLayout(layout)
 
-    def _setup_callbacks(self):
-        """Настройка callback'ов для сервисов"""
-        # Wake Word
-        self.wake_word_service.set_wake_word_callback(self._on_wake_word_detected)
-        self.wake_word_service.set_audio_level_callback(self._on_audio_level_wake)
+    def _connect_signals(self):
+        """Подключение сигналов UI"""
+        # Кнопки
+        self.start_btn.clicked.connect(self._on_start_stop_clicked)
+        self.calibrate_btn.clicked.connect(self._on_calibrate_clicked)
+        self.clear_btn.clicked.connect(self._on_clear_clicked)
+        self.reset_context_btn.clicked.connect(self._on_reset_context_clicked)
 
-        # Speech Recognition
-        self.speech_service.set_speech_recognized_callback(self._on_speech_recognized)
-        self.speech_service.set_audio_level_callback(self._on_audio_level_speech)
-        self.speech_service.set_noise_floor_callback(self._on_noise_floor_calibrated)
+        # Настройки (только после загрузки)
+        self.sensitivity_slider.valueChanged.connect(self._on_sensitivity_changed)
 
-        # Gemini
-        self.gemini_service.set_response_callback(self._on_gemini_response)
-        self.gemini_service.set_error_callback(self._on_gemini_error)
+        # Thread-safe сигналы
+        self.update_status_signal.connect(self._set_status)
+        self.update_audio_level_signal.connect(self._set_audio_level)
+        self.add_log_signal.connect(self._add_log)
+        self.update_history_signal.connect(self._update_history)
+        self.update_noise_floor_signal.connect(self._update_noise_floor)
+        self.update_threshold_signal.connect(self._update_threshold)
+        self.show_notification_signal.connect(self._show_notification)
+        self.show_error_signal.connect(self._show_error)
+
+    def _connect_controller(self):
+        """Подключение к контроллеру"""
+        self.controller.set_callback('on_state_changed', self._on_state_changed)
+        self.controller.set_callback('on_status_update', lambda text, color: self.update_status_signal.emit(text, color))
+        self.controller.set_callback('on_audio_level', lambda rms, status: self.update_audio_level_signal.emit(rms, status))
+        self.controller.set_callback('on_log', lambda msg: self.add_log_signal.emit(msg))
+        self.controller.set_callback('on_history_updated', lambda count: self.update_history_signal.emit(count))
+        self.controller.set_callback('on_noise_floor_calibrated', lambda floor: self.update_noise_floor_signal.emit(floor))
+        self.controller.set_callback('on_threshold_updated', lambda threshold: self.update_threshold_signal.emit(threshold))
+        self.controller.set_callback('on_llm_response', self._on_llm_response)
+        self.controller.set_callback('on_llm_error', lambda error: self.show_error_signal.emit("Ошибка Gemini", error))
+        self.controller.set_callback('on_error', lambda error: self.show_error_signal.emit("Ошибка", error))
 
     def _load_settings(self):
-        """Загрузка сохраненных настроек"""
-        logger.info("Загрузка настроек из реестра...")
+        """Загрузка настроек"""
+        try:
+            # Микрофон
+            saved_device = self.settings.value("device_index", type=int)
+            if saved_device is not None:
+                for i in range(self.device_combo.count()):
+                    if self.device_combo.itemData(i) == saved_device:
+                        self.device_combo.setCurrentIndex(i)
+                        break
 
-        # Микрофон
-        saved_device = self.settings.value("device_index", type=int)
-        if saved_device is not None:
-            for i in range(self.device_combo.count()):
-                if self.device_combo.itemData(i) == saved_device:
-                    self.device_combo.setCurrentIndex(i)
-                    logger.info(f"Загружен микрофон: index={saved_device}")
-                    break
+            # Чувствительность
+            saved_sensitivity = self.settings.value("sensitivity", type=int)
+            if saved_sensitivity is not None:
+                self.sensitivity_slider.setValue(saved_sensitivity)
 
-        # Чувствительность
-        saved_sensitivity = self.settings.value("sensitivity", type=int)
-        if saved_sensitivity is not None:
-            self.sensitivity_slider.setValue(saved_sensitivity)
-            logger.info(f"Загружена чувствительность: {saved_sensitivity}")
+            # Ключевое слово
+            saved_wake_word = self.settings.value("wake_word")
+            if saved_wake_word:
+                self.wake_word_input.setText(str(saved_wake_word))
+            else:
+                default_wake_word = config.get('wake_word.keyword', 'привет ассистент')
+                self.wake_word_input.setText(default_wake_word)
 
-        # Ключевое слово
-        saved_wake_word = self.settings.value("wake_word")
-        if saved_wake_word:
-            self.wake_word_input.setText(str(saved_wake_word))
-            logger.info(f"Загружено ключевое слово: '{saved_wake_word}'")
-        else:
-            default_wake_word = config.get('wake_word.keyword', 'привет ассистент')
-            self.wake_word_input.setText(default_wake_word)
-            logger.info(f"Дефолтное ключевое слово: '{default_wake_word}'")
+            # Подключаем сигналы ПОСЛЕ загрузки
+            self.wake_word_input.editingFinished.connect(self._save_settings)
+            self.device_combo.currentIndexChanged.connect(self._save_settings)
 
-        # Подключаем сигналы ПОСЛЕ загрузки всех значений
-        self.wake_word_input.editingFinished.connect(self._save_settings)
-        self.device_combo.currentIndexChanged.connect(self._save_settings)
+            logger.info("✓ Настройки загружены")
+
+        except Exception as e:
+            logger.error(f"Ошибка загрузки настроек: {e}", exc_info=True)
 
     def _save_settings(self):
-        """Сохранение текущих настроек"""
-        # НЕ сохраняем во время инициализации!
-        if hasattr(self, '_is_initializing') and self._is_initializing:
+        """Сохранение настроек"""
+        if self._is_initializing:
             return
 
-        device = self.device_combo.currentData()
-        sensitivity = self.sensitivity_slider.value()
-        wake_word = self.wake_word_input.text()
-
-        logger.info(f"Сохранение: device={device}, sensitivity={sensitivity}, wake_word='{wake_word}'")
-
-        self.settings.setValue("device_index", device)
-        self.settings.setValue("sensitivity", sensitivity)
-        self.settings.setValue("wake_word", wake_word)
-        self.settings.sync()
-
-        logger.debug("Настройки сохранены")
+        try:
+            self.settings.setValue("device_index", self.device_combo.currentData())
+            self.settings.setValue("sensitivity", self.sensitivity_slider.value())
+            self.settings.setValue("wake_word", self.wake_word_input.text())
+            self.settings.sync()
+            logger.debug("✓ Настройки сохранены")
+        except Exception as e:
+            logger.error(f"Ошибка сохранения настроек: {e}", exc_info=True)
 
     def _apply_theme(self):
-        """Применить темную тему"""
+        """Применить тему"""
         theme = config.get('ui.theme', 'dark')
-
         if theme == 'dark':
             self.setStyleSheet("""
                 QMainWindow, QWidget {
@@ -350,335 +438,247 @@ class MainWindow(QMainWindow):
                     margin: -5px 0;
                     border-radius: 9px;
                 }
-                
             """)
 
-    def _toggle_listening(self):
-        """Переключение состояния прослушивания"""
-        if self.is_listening:
-            self._stop_listening()
-        else:
-            self._start_listening()
+    # === Обработчики UI событий ===
 
-    def _start_listening(self):
-        """Запуск прослушивания"""
-        device_index = self.device_combo.currentData()
-
-        if device_index is None:
-            QMessageBox.warning(self, "Ошибка", "Выберите микрофон")
-            return
-
+    def _on_start_stop_clicked(self):
+        """Запуск/остановка"""
         try:
-            # Показываем оверлей
-            self.loading_overlay.show_loading("Загрузка моделей...")
+            if self.controller.state == AssistantState.STOPPED:
+                device_index = self.device_combo.currentData()
+                if device_index is None:
+                    QMessageBox.warning(self, "Ошибка", "Выберите микрофон")
+                    return
 
-            # Инициализация моделей
-            self._set_status("Загрузка Vosk...", "orange")
-            QTimer.singleShot(100, lambda: self._init_vosk(device_index))
+                wake_word = self.wake_word_input.text()
+                self.loading_overlay.show_loading("Инициализация...")
 
-        except Exception as e:
-            self.loading_overlay.hide_loading()
-            logger.error(f"Ошибка запуска: {e}")
-            QMessageBox.critical(self, "Ошибка", f"Не удалось запустить:\n{str(e)}")
-            self._set_status(f"Ошибка: {str(e)}", "red")
-
-    def _reset_context(self):
-        """Сброс контекста - создание новой сессии"""
-        history_length = self.gemini_service.get_history_length()
-
-        reply = QMessageBox.question(
-            self,
-            "Сброс контекста",
-            f"Создать новую сессию?\n\nТекущая история: {history_length} сообщений\nСтарая сессия сохранится в базе данных.",
-            QMessageBox.Yes | QMessageBox.No
-        )
-
-        if reply == QMessageBox.Yes:
-            self.gemini_service.clear_history()
-            self._add_log(f"Новая сессия создана (старая сохранена)")
-
-            # Обновляем индикатор
-            if hasattr(self, 'history_label'):
-                self.history_label.setText("История: 0 сообщений")
-
-    def _init_vosk(self, device_index):
-        """Инициализация Vosk в отдельном потоке"""
-        from PyQt5.QtCore import QThread, pyqtSignal
-
-        class VoskLoaderThread(QThread):
-            success = pyqtSignal()
-            error = pyqtSignal(str)
-            progress = pyqtSignal(str)
-
-            def __init__(self, service, wake_word):
-                super().__init__()
-                self.service = service
-                self.wake_word = wake_word
-
-            def run(self):
-                try:
-                    self.progress.emit("Загрузка Vosk...")
-                    self.service.initialize(self.wake_word)
-                    self.success.emit()
-                except Exception as e:
-                    self.error.emit(str(e))
-
-        wake_word = self.wake_word_input.text()
-        self.loader_thread = VoskLoaderThread(self.wake_word_service, wake_word)
-        self.loader_thread.progress.connect(lambda msg: self.loading_overlay.show_loading(msg))
-        self.loader_thread.success.connect(lambda: self._init_whisper(device_index, wake_word))
-        self.loader_thread.error.connect(self._on_init_error)
-        self.loader_thread.start()
-
-    def _on_init_error(self, error_msg):
-        """Обработка ошибки инициализации"""
-        self.loading_overlay.hide_loading()
-        logger.error(f"Ошибка инициализации: {error_msg}")
-        QMessageBox.critical(self, "Ошибка", f"Не удалось инициализировать:\n{error_msg}")
-        self._set_status("Ошибка", "red")
-
-    def _init_whisper(self, device_index, wake_word):
-        """Инициализация Whisper в отдельном потоке"""
-        from PyQt5.QtCore import QThread, pyqtSignal
-
-        class WhisperLoaderThread(QThread):
-            success = pyqtSignal()
-            error = pyqtSignal(str)
-            progress = pyqtSignal(str)
-
-            def __init__(self, service, sensitivity):
-                super().__init__()
-                self.service = service
-                self.sensitivity = sensitivity
-
-            def run(self):
-                try:
-                    model_name = config.get('speech_recognition.model_name', 'large-v3')
-                    self.progress.emit(f"Загрузка Whisper {model_name}...")
-                    self.service.initialize()
-                    self.service.update_sensitivity(self.sensitivity)
-                    self.success.emit()
-                except Exception as e:
-                    self.error.emit(str(e))
-
-        self.whisper_thread = WhisperLoaderThread(self.speech_service, self.sensitivity_slider.value())
-        self.whisper_thread.progress.connect(lambda msg: self.loading_overlay.show_loading(msg))
-        self.whisper_thread.success.connect(lambda: self._finalize_startup(device_index, wake_word))
-        self.whisper_thread.error.connect(self._on_init_error)
-        self.whisper_thread.start()
-
-    def _finalize_startup(self, device_index, wake_word):
-        """Завершение запуска после загрузки моделей"""
-        try:
-            # Скрываем оверлей
-            self.loading_overlay.hide_loading()
-
-            # Запуск захвата
-            self.audio_service.start_capture(device_index, self._on_audio_data)
-
-            self.is_listening = True
-            self.start_btn.setText("Остановить")
-            self.calibrate_btn.setEnabled(True)
-
-            self._set_status(f"Слушаю... Скажите '{wake_word}'", "green")
-            self._add_log(f"✅ Запущено! Микрофон: {self.device_combo.currentText()}")
-
-            # Автокалибровка (если включена в конфиге)
-            auto_calibrate = config.get('speech_recognition.auto_calibrate', True)
-            if auto_calibrate:
-                QTimer.singleShot(2000, self._calibrate)
+                success = self.controller.start(device_index, wake_word)
+                if not success:
+                    self.loading_overlay.hide_loading()
             else:
-                logger.info("Автокалибровка отключена")
-
+                self.controller.stop()
         except Exception as e:
-            logger.error(f"Ошибка запуска: {e}")
-            QMessageBox.critical(self, "Ошибка", f"Ошибка запуска:\n{str(e)}")
-            self._set_status("Ошибка", "red")
+            logger.error(f"Ошибка start/stop: {e}", exc_info=True)
+            self.loading_overlay.hide_loading()
 
-    def _stop_listening(self):
-        """Остановка прослушивания"""
+    def _on_calibrate_clicked(self):
+        """Калибровка"""
         try:
-            # Останавливаем все сервисы в правильном порядке
-            self.audio_service.stop_capture()
-            self.speech_service.stop()
-            self.wake_word_service.stop()
-
-            # Отменяем все таймеры и потоки
-            if hasattr(self, 'loader_thread') and self.loader_thread:
-                if self.loader_thread.isRunning():
-                    self.loader_thread.quit()
-                    self.loader_thread.wait(1000)  # Ждем 1 секунду
-
-            if hasattr(self, 'whisper_thread') and self.whisper_thread:
-                if self.whisper_thread.isRunning():
-                    self.whisper_thread.quit()
-                    self.whisper_thread.wait(1000)
-
-            # Сброс состояния
-            self.is_listening = False
-            self.start_btn.setText("Запустить")
-            self.calibrate_btn.setEnabled(False)
-
-            self._set_status("Остановлено", "gray")
-            self._set_audio_level(0, "Тишина", "gray")
-            self._add_log("⏹️ Остановлено")
-
+            self.controller.calibrate_noise_floor(2.0)
         except Exception as e:
-            logger.error(f"Ошибка при остановке: {e}")
+            logger.error(f"Ошибка калибровки: {e}", exc_info=True)
 
-    def _calibrate(self):
-        """Калибровка фонового шума"""
-        if not self.is_listening:
-            return
+    def _on_clear_clicked(self):
+        """Очистка лога"""
+        self.log_text.clear()
 
-        self._add_log("🔧 КАЛИБРОВКА: замолчите на 2 секунды...")
-        self._set_status("Калибровка... Не говорите!", "orange")
+    def _on_reset_context_clicked(self):
+        """Сброс контекста"""
+        try:
+            history_length = self.controller.get_history_length()
+            reply = QMessageBox.question(
+                self,
+                "Сброс контекста",
+                f"Создать новую сессию?\n\nТекущая история: {history_length} сообщений\nСтарая сессия сохранится в базе данных.",
+                QMessageBox.Yes | QMessageBox.No
+            )
 
-        import threading
-        def run_calibration():
-            self.speech_service.calibrate_noise_floor(2.0)
-            self.calibration_done.emit()  # Thread-safe сигнал
-
-        threading.Thread(target=run_calibration, daemon=True).start()
-
-    def _after_calibration(self):
-        """Вызывается после калибровки"""
-        wake_word = self.wake_word_input.text()
-        self._set_status(f"Слушаю... Скажите '{wake_word}'", "green")
-
-    def _on_audio_data(self, audio_data: bytes):
-        """Обработка аудио данных"""
-        if not self.wake_word_service.is_recording:
-            self.wake_word_service.process_audio(audio_data)
-        else:
-            self.speech_service.process_audio(audio_data)
-
-    def _on_wake_word_detected(self):
-        """Wake Word обнаружено"""
-        wake_word = self.wake_word_input.text()
-        self._set_status("🎤 Ключевое слово обнаружено! Слушаю команду...", "blue")
-        self._add_log("🔑 WAKE WORD обнаружено → переключение на Whisper")
-
-        self.speech_service.start_recording()
-
-    def _on_speech_recognized(self, text: str):
-        """Речь распознана"""
-        if text not in ["[тишина]", "[ошибка]"]:
-            timestamp = datetime.now().strftime("%H:%M:%S")
-            self._add_log(f"[{timestamp}] 💬 {text}")
-
-            # Отправка в Gemini
-            self._send_to_gemini(text)
-
-        wake_word = self.wake_word_input.text()
-        self._set_status(f"Слушаю... Скажите '{wake_word}'", "green")
-        self.wake_word_service.stop()
-
-    def _on_audio_level_wake(self, rms: float, status: str):
-        """Уровень звука от Wake Word"""
-        if not self.wake_word_service.is_recording:
-            self._set_audio_level(rms, status)
-
-    def _on_audio_level_speech(self, rms: float, status: str):
-        """Уровень звука от Speech Recognition"""
-        if self.speech_service.is_recording:
-            self._set_audio_level(rms, status)
-
-    def _on_noise_floor_calibrated(self, noise_floor: float):
-        """Калибровка завершена"""
-        self.noise_floor_label.setText(f"Фон: {noise_floor:.4f}")
-        self._add_log(f"✅ КАЛИБРОВКА: фоновый уровень = {noise_floor:.4f}")
-
-    def _send_to_gemini(self, query: str):
-        """Отправка запроса в Gemini"""
-        self._add_log(f"📤 Отправка в Gemini: {query}")
-        self._set_status("Обработка запроса...", "orange")
-
-        # Запуск в отдельном потоке
-        import threading
-        threading.Thread(
-            target=self.gemini_service.send_query,
-            args=(query,),
-            daemon=True
-        ).start()
-
-    def _on_gemini_response(self, response: str):
-        """Ответ от Gemini"""
-        self._add_log(f"📥 Ответ Gemini: {response}")
-        wake_word = self.wake_word_input.text()
-        self._set_status(f"Слушаю... Скажите '{wake_word}'", "green")
-
-        # Обновляем индикатор истории
-        history_count = self.gemini_service.get_history_length()
-        self.history_label.setText(f"История: {history_count} сообщений")
-
-        # Показать уведомление
-        self.notification_service.show_notification("Ответ ассистента", response)
-
-    def _on_gemini_error(self, error: str):
-        """Ошибка Gemini"""
-        self._add_log(f"❌ Ошибка Gemini: {error}")
-        self._set_status("Ошибка обработки запроса", "red")
-        self.notification_service.show_error("Ошибка", f"Не удалось получить ответ:\n{error}")
+            if reply == QMessageBox.Yes:
+                self.controller.reset_context()
+        except Exception as e:
+            logger.error(f"Ошибка сброса контекста: {e}", exc_info=True)
 
     def _on_sensitivity_changed(self, value: int):
-        """Изменение чувствительности"""
-        self.sens_value_label.setText(f"{value}/10")
-        self.speech_service.update_sensitivity(value)
+        """Изменение чувствительности - работает в реалтайм"""
+        try:
+            self.sens_value_label.setText(f"{value}/10")
 
-        # НЕ сохраняем во время инициализации
-        if not (hasattr(self, '_is_initializing') and self._is_initializing):
-            self._save_settings()
+            # Обновляем в контроллере (работает даже во время записи!)
+            self.controller.update_sensitivity(value)
+
+            # Обновляем отображение порога
+            self._update_threshold_display()
+
+            if not self._is_initializing:
+                self._save_settings()
+        except Exception as e:
+            logger.error(f"Ошибка изменения чувствительности: {e}", exc_info=True)
+
+    def _update_threshold_display(self):
+        """Обновить отображение порога на основе текущих значений"""
+        try:
+            # Получаем актуальный порог из сервиса
+            threshold = self.controller.speech_service.get_voice_threshold()
+            self.current_threshold = threshold
+
+            # Обновляем label
+            if threshold > 0:
+                self.threshold_label.setText(f"Порог: {threshold:.4f}")
+                self.threshold_label.setStyleSheet("color: #ff6464; font-size: 11px;")
+            else:
+                self.threshold_label.setText(f"Порог: не установлен")
+                self.threshold_label.setStyleSheet("color: #888; font-size: 11px;")
+
+            # Обновляем линию на прогресс-баре
+            self.audio_progress.set_threshold(threshold)
+
+            logger.debug(f"Порог обновлен: {threshold:.4f}")
+
+        except Exception as e:
+            logger.error(f"Ошибка обновления порога: {e}", exc_info=True)
+
+    # === Обработчики событий контроллера ===
+
+    def _on_state_changed(self, new_state: AssistantState):
+        """Изменение состояния"""
+        try:
+            if new_state == AssistantState.STOPPED:
+                self.start_btn.setText("Запустить")
+                self.calibrate_btn.setEnabled(False)
+                self.loading_overlay.hide_loading()
+            elif new_state == AssistantState.INITIALIZING:
+                self.loading_overlay.show_loading("Загрузка моделей...")
+            elif new_state == AssistantState.LISTENING_WAKE_WORD:
+                self.start_btn.setText("Остановить")
+                self.calibrate_btn.setEnabled(True)
+                self.loading_overlay.hide_loading()
+                # Обновляем порог при старте
+                self._update_threshold_display()
+            elif new_state == AssistantState.RECORDING_COMMAND:
+                pass  # Индикация в статусе
+            elif new_state == AssistantState.PROCESSING_LLM:
+                pass  # Индикация в статусе
+        except Exception as e:
+            logger.error(f"Ошибка обработки состояния: {e}", exc_info=True)
+
+    def _on_llm_response(self, response: str):
+        """Ответ LLM"""
+        try:
+            self.show_notification_signal.emit("Ответ ассистента", response)
+        except Exception as e:
+            logger.error(f"Ошибка обработки ответа: {e}", exc_info=True)
+
+    # === UI обновления (thread-safe) ===
 
     def _set_status(self, text: str, color: str):
         """Установить статус"""
-        self.status_label.setText(text)
-        self.status_label.setStyleSheet(f"color: {color}; font-weight: bold;")
+        try:
+            self.status_label.setText(text)
+            self.status_label.setStyleSheet(f"color: {color}; font-weight: bold;")
+        except Exception as e:
+            logger.error(f"Ошибка установки статуса: {e}", exc_info=True)
 
-    def _set_audio_level(self, rms: float, status: str, color: str = None):
+    def _set_audio_level(self, rms: float, status: str):
         """Установить уровень звука"""
-        level = min(int(rms * 300), 100)
-        self.audio_progress.setValue(level)
-        self.audio_progress.setFormat(status)
+        try:
+            level = min(int(rms * 300), 100)
+            self.audio_progress.setValue(level)
+            self.audio_progress.setFormat(f"{status} ({rms:.4f})")
 
-        if color is None:
-            if status == "Тишина":
-                color = "gray"
-            elif status == "Шум":
-                color = "orange"
-            else:
-                color = "#0d7377"
-
-        self.audio_progress.setStyleSheet(f"""
-            QProgressBar::chunk {{
-                background-color: {color};
-            }}
-        """)
+            color = "gray" if status == "Тишина" else "orange" if status == "Шум" else "#0d7377"
+            self.audio_progress.setStyleSheet(f"""
+                QProgressBar::chunk {{
+                    background-color: {color};
+                }}
+            """)
+        except Exception as e:
+            logger.error(f"Ошибка установки уровня звука: {e}", exc_info=True)
 
     def _add_log(self, message: str):
-        """Добавить запись в лог"""
-        self.log_text.append(message)
-        # Прокрутка вниз
-        scrollbar = self.log_text.verticalScrollBar()
-        scrollbar.setValue(scrollbar.maximum())
+        """Добавить в лог"""
+        try:
+            self.log_text.append(message)
+            scrollbar = self.log_text.verticalScrollBar()
+            scrollbar.setValue(scrollbar.maximum())
+        except Exception as e:
+            logger.error(f"Ошибка добавления в лог: {e}", exc_info=True)
 
-    def _clear_log(self):
-        """Очистить лог"""
-        self.log_text.clear()
+    def _update_history(self, count: int):
+        """Обновить индикатор истории"""
+        try:
+            self.history_label.setText(f"История: {count} сообщений")
+        except Exception as e:
+            logger.error(f"Ошибка обновления истории: {e}", exc_info=True)
+
+    def _update_noise_floor(self, floor: float):
+        """Обновить индикатор калибровки"""
+        try:
+            self.current_noise_floor = floor
+
+            if floor > 0:
+                self.noise_floor_label.setText(f"Фон: {floor:.4f} ✓")
+                self.noise_floor_label.setStyleSheet("color: #4CAF50; font-size: 11px; font-weight: bold;")
+            else:
+                self.noise_floor_label.setText(f"Фон: не откалиброван")
+                self.noise_floor_label.setStyleSheet("color: #888; font-size: 11px;")
+
+            # Обновляем линию фона на прогресс-баре
+            self.audio_progress.set_noise_floor(floor)
+
+            # Также обновляем порог (он зависит от фона)
+            self._update_threshold_display()
+
+            logger.info(f"✓ Noise floor обновлен в UI: {floor:.4f}")
+
+        except Exception as e:
+            logger.error(f"Ошибка обновления noise floor: {e}", exc_info=True)
+
+    def _update_threshold(self, threshold: float):
+        """Обновить порог (вызывается при изменении чувствительности)"""
+        try:
+            self.current_threshold = threshold
+
+            if threshold > 0:
+                self.threshold_label.setText(f"Порог: {threshold:.4f}")
+                self.threshold_label.setStyleSheet("color: #ff6464; font-size: 11px; font-weight: bold;")
+            else:
+                self.threshold_label.setText(f"Порог: не установлен")
+                self.threshold_label.setStyleSheet("color: #888; font-size: 11px;")
+
+            self.audio_progress.set_threshold(threshold)
+
+            logger.info(f"✓ Порог обновлен в UI: {threshold:.4f}")
+
+        except Exception as e:
+            logger.error(f"Ошибка обновления порога: {e}", exc_info=True)
+
+    def _show_notification(self, title: str, message: str):
+        """Показать уведомление"""
+        try:
+            self.notification_service.show_notification(title, message)
+        except Exception as e:
+            logger.error(f"Ошибка показа уведомления: {e}", exc_info=True)
+
+    def _show_error(self, title: str, message: str):
+        """Показать ошибку"""
+        try:
+            self.notification_service.show_error(title, message)
+        except Exception as e:
+            logger.error(f"Ошибка показа ошибки: {e}", exc_info=True)
+
+    # === Закрытие ===
 
     def closeEvent(self, event):
         """Закрытие окна"""
-        self._save_settings()
-        if self.is_listening:
-            self.loading_overlay.show_loading("Остановка сервисов...")
-            QTimer.singleShot(100, lambda: self._finalize_close(event))
-        else:
+        try:
+            self._save_settings()
+            if self.controller.state != AssistantState.STOPPED:
+                self.loading_overlay.show_loading("Остановка...")
+                QTimer.singleShot(100, lambda: self._finalize_close(event))
+            else:
+                event.accept()
+        except Exception as e:
+            logger.error(f"Ошибка при закрытии: {e}", exc_info=True)
             event.accept()
 
     def _finalize_close(self, event):
-        """Финальное закрытие после остановки"""
-        self._stop_listening()
-        self._save_settings()
-        self.loading_overlay.hide_loading()
-        event.accept()
-        self.close()
+        """Финальное закрытие"""
+        try:
+            self.controller.stop()
+            self.loading_overlay.hide_loading()
+            event.accept()
+        except Exception as e:
+            logger.error(f"Ошибка финального закрытия: {e}", exc_info=True)
+            event.accept()

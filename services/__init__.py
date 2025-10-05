@@ -7,11 +7,14 @@ from .wake_word import WakeWordService
 from .speech_recognition import SpeechRecognitionService
 from .llm_service import GeminiService
 from .notification_service import NotificationService
+from .assistant_controller import VoiceAssistantController, AssistantState
 
 __all__ = [
     'AudioCaptureService',
-    'WakeWordService', 
+    'WakeWordService',
     'SpeechRecognitionService',
     'GeminiService',
-    'NotificationService'
+    'NotificationService',
+    'VoiceAssistantController',
+    'AssistantState'
 ]
